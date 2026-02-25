@@ -1,0 +1,392 @@
+.TH UFT 1 "February 2026" "uft 3.0.0" "User Commands"
+.SH NAME
+uft \- bulk file transfer over SSH
+.SH SYNOPSIS
+.B uft
+.RB [ \-H
+.IR host ]
+.RB [ \-u
+.IR user ]
+.RB [ \-r
+.IR path ]
+.RB [ \-l
+.IR path ]
+.RB [ options ]
+.SH DESCRIPTION
+.B uft
+transfers large directory trees (100K+ files) over SSH using the fastest
+available method. It auto-detects tools on both ends and picks between
+tar pipes, netcat streams, or parallel rsync.
+.PP
+Designed for bulk image/frame downloads where per-file overhead kills
+performance. A single tar stream avoids the SSH handshake-per-file
+penalty that makes scp/sftp slow on large file counts.
+.SH OPTIONS
+.TP
+.BR \-H ", " \-\-host " " \fIHOST\fR
+Remote hostname or IP address.
+.TP
+.BR \-u ", " \-\-user " " \fIUSER\fR
+SSH username.
+.TP
+.BR \-r ", " \-\-remote\-path " " \fIPATH\fR
+Source directory on the remote host.
+.TP
+.BR \-l ", " \-\-local\-path " " \fIPATH\fR
+Local destination directory.
+.TP
+.BR \-m ", " \-\-mode " " \fIMODE\fR
+Transfer mode. One of:
+.RS
+.TP
+.B auto
+(default) Pick the fastest available mode.
+.TP
+.B tar\-stream
+Single tar pipe compressed over SSH. Fast, encrypted.
+.TP
+.B tar\-nc
+Tar over netcat. Fastest option but unencrypted. Use only on trusted networks.
+.TP
+.B parallel\-rsync
+Multiple rsync processes in parallel. Slower but supports resume.
+.TP
+.B benchmark
+Run throughput benchmarks and report results.
+.RE
+.TP
+.BR \-c ", " \-\-compress " " \fIALG\fR
+Compression algorithm: auto, lz4, pigz, zstd, gzip, none. Default: auto.
+.TP
+.BR \-j ", " \-\-jobs " " \fIN\fR
+Number of parallel workers for rsync mode. Default: 8.
+.TP
+.BR \-s ", " \-\-streams " " \fIN\fR
+Number of parallel netcat streams for tar\-nc mode. Default: 4.
+.TP
+.BR \-p ", " \-\-port " " \fIPORT\fR
+SSH port. Default: 22.
+.TP
+.BR \-k ", " \-\-key " " \fIFILE\fR
+Path to SSH private key.
+.TP
+.BR \-b ", " \-\-bwlimit " " \fIKB/S\fR
+Bandwidth limit in KB/s. Applies to rsync mode natively; tar modes
+require
+.B pv
+installed locally.
+.TP
+.BR \-J ", " \-\-jump " " \fIHOST\fR
+SSH jump/bastion host, passed as
+.BR ssh\ \-J .
+The remote SSH connection is tunnelled through this host.
+Note: tar\-nc mode is incompatible with jump hosts and automatically
+falls back to tar\-stream.
+.TP
+.BR \-\-exclude " " \fIPATTERN\fR
+Exclude files matching
+.IR PATTERN .
+Can be specified multiple times. Patterns use tar/rsync glob syntax.
+.TP
+.BR \-\-exclude\-from " " \fIFILE\fR
+Read exclude patterns from
+.IR FILE ,
+one per line. Blank lines and lines starting with # are ignored.
+.TP
+.B \-\-copy\-links
+Dereference (follow) symbolic links instead of preserving them.
+Tar modes use \fBtar \-h\fR; rsync mode uses \fBrsync \-\-copy\-links\fR.
+.TP
+.BR \-\-newer " " \fIDATE\fR
+Only transfer files newer than
+.IR DATE .
+Accepts any date string understood by GNU tar's \fB\-\-newer\fR flag (e.g.
+"2025\-01\-01", "2 days ago").
+.TP
+.B \-\-skip\-scan
+Skip the remote file count and size scan during preflight. Useful when
+scanning is slow on very large directories (millions of files). Disk
+space checks and time estimates are unavailable when this is set.
+.TP
+.BR \-\-keep\-logs " " \fIN\fR
+Keep the
+.I N
+most recent session logs and prune older ones. Default: 20.
+Set to 0 to disable rotation (keep all logs).
+.TP
+.BR \-\-config " " \fIPATH\fR
+Path to the configuration file. Default:
+.IR ~/.uftrc .
+See
+.B CONFIG FILE
+below.
+.TP
+.B \-\-resume
+Resume a previously interrupted transfer. Works with parallel\-rsync mode.
+Completed directories are tracked and skipped on re\-run.
+.TP
+.B \-\-verify
+Verify file counts and sizes after transfer (default: on).
+.TP
+.B \-\-no\-verify
+Skip post-transfer verification.
+.TP
+.B \-\-checksum
+Spot-check MD5 hashes on 100 randomly sampled files after transfer.
+.TP
+.B \-\-dry\-run
+Run preflight checks only. Shows file counts, sizes, disk space, and
+a time estimate without transferring anything.
+.TP
+.B \-\-tuning
+Print network and kernel tuning tips.
+.TP
+.BR \-y ", " \-\-yes
+Skip confirmation prompts.
+.TP
+.BR \-\-local\-ip " " \fIIP\fR
+Override the auto-detected local IP address. Used by tar\-nc mode
+when the remote host sends data back over netcat.
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.BR \-h ", " \-\-help
+Show usage information.
+.SH TRANSFER MODES
+.SS tar\-stream
+Pipes \fBtar\fR through a compressor into a single SSH connection.
+No per-file overhead \(em transfer time depends on total data size
+and bandwidth, not file count. Picks the fastest cipher available
+(typically aes128-gcm with AES-NI). Best for first-time bulk
+downloads, especially with high file counts over high-latency links.
+.SS tar\-nc
+Same as tar\-stream but replaces SSH with raw TCP via netcat.
+No encryption overhead. Can split across multiple parallel streams.
+Only safe on private networks.
+.PP
+Not compatible with jump hosts; automatically falls back to tar\-stream
+when \fB\-\-jump\fR is set.
+.SS parallel\-rsync
+Runs N rsync processes over a shared SSH multiplexed connection.
+Each process handles a top-level subdirectory. Tracks progress in
+a manifest file so interrupted transfers can resume. Uses size-based
+bin-packing to balance work across workers. On high-latency links,
+per-file overhead makes this slower than tar modes; on low-latency
+links the difference is small. The only option when you need
+incremental or resumable sync.
+.PP
+Actual speed depends on your network. Run \fBuft \-m benchmark\fR to
+measure your link.
+.SH CONFIG FILE
+.B uft
+reads a config file at startup. The default location is
+.IR ~/.uftrc ,
+overridden with
+.B \-\-config
+or the
+.B UFT_CONFIG
+environment variable. CLI flags always take precedence over config values.
+.PP
+Format is
+.IR key\ =\ value ,
+one per line. Comments start with
+.BR # .
+.PP
+.nf
+.RS
+# ~/.uftrc
+host = server.com
+user = deploy
+port = 22
+key = ~/.ssh/id_ed25519
+mode = auto
+compress = lz4
+jobs = 12
+streams = 4
+jump = bastion.example.com
+keep_logs = 30
+exclude = *.log
+exclude = .git
+exclude = __pycache__
+newer = 2025-01-01
+.RE
+.fi
+.PP
+Supported keys:
+.BR host ,
+.BR user ,
+.BR remote_path ,
+.BR local_path ,
+.BR port ,
+.BR key ,
+.BR mode ,
+.BR compress ,
+.BR jobs ,
+.BR streams ,
+.BR nc_port ,
+.BR verify ,
+.BR bwlimit ,
+.BR local_ip ,
+.BR symlinks ,
+.BR jump ,
+.BR keep_logs ,
+.BR exclude " (repeatable),"
+.BR exclude_from ,
+.BR newer ,
+.BR skip_scan .
+.SH ENVIRONMENT
+.TP
+.B UFT_HOST
+Default remote host.
+.TP
+.B UFT_USER
+Default SSH user.
+.TP
+.B UFT_REMOTE
+Default remote path.
+.TP
+.B UFT_LOCAL
+Default local path.
+.TP
+.B UFT_PORT
+Default SSH port.
+.TP
+.B UFT_KEY
+Default SSH key path.
+.TP
+.B UFT_MODE
+Default transfer mode.
+.TP
+.B UFT_COMPRESS
+Default compression algorithm.
+.TP
+.B UFT_JOBS
+Default parallel job count.
+.TP
+.B UFT_STREAMS
+Default netcat stream count.
+.TP
+.B UFT_JUMP
+Default jump/bastion host.
+.TP
+.B UFT_NEWER
+Default \-\-newer date filter.
+.TP
+.B UFT_EXCLUDE_FROM
+Default exclude-from file.
+.TP
+.B UFT_SKIP_SCAN
+Skip remote scan (set to "true").
+.TP
+.B UFT_KEEP_LOGS
+Number of session logs to keep.
+.TP
+.B UFT_COPY_LINKS
+Set to "true" to dereference symlinks.
+.TP
+.B UFT_CONFIG
+Config file path (default: ~/.uftrc).
+.SH FILES
+.TP
+.I ~/.uftrc
+Default configuration file.
+.TP
+.I ~/.uft/logs/
+Session logs.
+.TP
+.I ~/.uft/manifests/
+Directory listings from remote scans.
+.TP
+.I ~/.uft/resume/
+Resume state for parallel\-rsync mode.
+.TP
+.I ~/.uft/locks/
+Transfer locks (one per destination path).
+.SH EXAMPLES
+Auto-detect fastest method:
+.PP
+.RS
+uft -H server.com -u deploy -r /data/frames -l ./frames
+.RE
+.PP
+Maximum speed on a trusted network:
+.PP
+.RS
+uft -H 10.0.0.5 -u root -r /data/frames -l ./frames -m tar-nc -s 8
+.RE
+.PP
+Resumable transfer with 16 workers:
+.PP
+.RS
+uft -H srv -u admin -r /data -l ./data -m parallel-rsync -j 16
+.RE
+.PP
+Resume after interruption:
+.PP
+.RS
+uft -H srv -u admin -r /data -l ./data -m parallel-rsync --resume
+.RE
+.PP
+Exclude patterns:
+.PP
+.RS
+uft -H srv -u deploy -r /data -l ./data --exclude '*.log' --exclude '.git'
+.RE
+.PP
+Exclude from file:
+.PP
+.RS
+uft -H srv -u deploy -r /data -l ./data --exclude-from .uftignore
+.RE
+.PP
+Only files newer than a date:
+.PP
+.RS
+uft -H srv -u deploy -r /data -l ./data --newer '2025-06-01'
+.RE
+.PP
+Transfer through a jump host:
+.PP
+.RS
+uft -H internal.lan -u deploy -r /data -l ./data -J bastion.example.com
+.RE
+.PP
+Skip scan on huge directories:
+.PP
+.RS
+uft -H srv -u admin -r /giant-dataset -l ./data --skip-scan
+.RE
+.PP
+Use a custom config:
+.PP
+.RS
+uft --config ~/projects/.uftrc -r /data -l ./data
+.RE
+.PP
+Dry run (preflight only):
+.PP
+.RS
+uft -H srv -u admin -r /data -l ./data --dry-run
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Transfer completed successfully.
+.TP
+.B 1
+Error (connection failure, missing arguments, disk space, etc).
+.TP
+.B 130
+Interrupted by user (Ctrl-C).
+.SH SEE ALSO
+.BR rsync (1),
+.BR ssh (1),
+.BR tar (1),
+.BR nc (1),
+.BR lz4 (1),
+.BR pv (1)
+.SH AUTHORS
+Pavly
+.SH BUGS
+Report bugs at https://github.com/pavlyhalim/uft/issues

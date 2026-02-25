@@ -1,0 +1,1822 @@
+#!/usr/bin/env bash
+#
+# uft — bulk file transfer over SSH
+#
+# Transfers large directory trees (100K+ files) using the fastest
+# available method: tar pipes, netcat streams, or parallel rsync.
+#
+# Usage: uft -H host -u user -r /remote/path -l /local/path
+# See:   uft --help
+#
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    set -Euo pipefail
+    IFS=$'\n\t'
+    trap '_cleanup' EXIT
+    trap '_on_error $LINENO' ERR
+    trap '_on_interrupt' INT TERM
+fi
+
+# --- config (override via CLI flags or env vars) ---
+
+REMOTE_HOST="${UFT_HOST:-}"
+REMOTE_USER="${UFT_USER:-}"
+REMOTE_PATH="${UFT_REMOTE:-}"
+LOCAL_PATH="${UFT_LOCAL:-}"
+SSH_PORT="${UFT_PORT:-22}"
+SSH_KEY="${UFT_KEY:-}"
+MODE="${UFT_MODE:-auto}"
+COMPRESS="${UFT_COMPRESS:-auto}"
+PARALLEL_JOBS="${UFT_JOBS:-8}"
+NC_BASE_PORT="${UFT_NCPORT:-19000}"
+NUM_STREAMS="${UFT_STREAMS:-4}"
+VERIFY="${UFT_VERIFY:-true}"
+RESUME="${UFT_RESUME:-false}"
+DRY_RUN="${UFT_DRY:-false}"
+BANDWIDTH_LIMIT="${UFT_BW:-}"
+SSH_CIPHER=""
+CHECKSUM_VERIFY="${UFT_CHECKSUM:-false}"
+SKIP_CONFIRM="${UFT_YES:-false}"
+LOCAL_IP_OVERRIDE="${UFT_LOCAL_IP:-}"
+
+# v3 config vars
+EXCLUDES=()
+EXCLUDE_FROM="${UFT_EXCLUDE_FROM:-}"
+CONFIG_FILE="${UFT_CONFIG:-${HOME}/.uftrc}"
+SYMLINK_MODE="${UFT_SYMLINKS:-preserve}"
+SKIP_SCAN="${UFT_SKIP_SCAN:-false}"
+JUMP_HOST="${UFT_JUMP:-}"
+NEWER_THAN="${UFT_NEWER:-}"
+KEEP_LOGS="${UFT_KEEP_LOGS:-20}"
+# SYMLINK_MODE handles --copy-links; UFT_COPY_LINKS maps there
+if [[ "${UFT_COPY_LINKS:-false}" == "true" ]]; then
+    SYMLINK_MODE="dereference"
+fi
+
+# --- internal ---
+
+VERSION="3.0.0"
+SCRIPT_NAME="$(basename "$0")"
+SESSION_ID="$(date +%Y%m%d_%H%M%S)_$$"
+LOG_DIR="${HOME}/.uft/logs"
+MANIFEST_DIR="${HOME}/.uft/manifests"
+RESUME_DIR="${HOME}/.uft/resume"
+LOCK_DIR="${HOME}/.uft/locks"
+SSH_MUX_SOCKET=""
+CLEANUP_PIDS=()
+TRANSFER_START=0
+TOTAL_BYTES=0
+TOTAL_FILES=0
+REMOTE_TOOLS=()
+LOCAL_TOOLS=()
+FASTEST_CIPHER=""
+BEST_MODE=""
+LOCK_FILE=""
+SPINNER_PID=""
+
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    MAGENTA=''
+    BOLD=''
+    DIM=''
+    NC=''
+fi
+
+# --- logging ---
+
+_log_file=""
+
+_init_logging() {
+    mkdir -p "$LOG_DIR" "$MANIFEST_DIR" "$RESUME_DIR" "$LOCK_DIR"
+    _log_file="${LOG_DIR}/${SESSION_ID}.log"
+    echo "=== uft v${VERSION} — ${SESSION_ID} ===" >"$_log_file"
+    echo "=== $(date -u '+%Y-%m-%d %H:%M:%S UTC') ===" >>"$_log_file"
+    _rotate_logs
+}
+
+_ts() { date '+%H:%M:%S'; }
+
+log() {
+    echo -e "${DIM}[$(_ts)]${NC} $*"
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" >>"$_log_file" 2>/dev/null || true
+}
+info() {
+    echo -e "${DIM}[$(_ts)]${NC} ${CYAN}INFO${NC}  $*"
+    echo "[$(date -u '+%T')] INFO  $*" >>"$_log_file" 2>/dev/null || true
+}
+ok() {
+    echo -e "${DIM}[$(_ts)]${NC} ${GREEN}  OK${NC}  $*"
+    echo "[$(date -u '+%T')]   OK  $*" >>"$_log_file" 2>/dev/null || true
+}
+warn() {
+    echo -e "${DIM}[$(_ts)]${NC} ${YELLOW}WARN${NC}  $*"
+    echo "[$(date -u '+%T')] WARN  $*" >>"$_log_file" 2>/dev/null || true
+}
+err() {
+    echo -e "${DIM}[$(_ts)]${NC} ${RED}FAIL${NC}  $*" >&2
+    echo "[$(date -u '+%T')] FAIL  $*" >>"$_log_file" 2>/dev/null || true
+}
+die() {
+    err "$*"
+    exit 1
+}
+
+_header() {
+    echo ""
+    echo -e "${BOLD}${BLUE}--- $* ---${NC}"
+    echo ""
+}
+
+_sub() {
+    echo -e "  ${MAGENTA}>${NC} ${BOLD}$*${NC}"
+}
+
+_human_bytes() {
+    local bytes=$1
+    # pure bash — no bc dependency
+    if ((bytes >= 1073741824)); then
+        local gb_x10=$((bytes * 10 / 1073741824))
+        printf "%d.%d GB" $((gb_x10 / 10)) $((gb_x10 % 10))
+    elif ((bytes >= 1048576)); then
+        local mb_x10=$((bytes * 10 / 1048576))
+        printf "%d.%d MB" $((mb_x10 / 10)) $((mb_x10 % 10))
+    elif ((bytes >= 1024)); then
+        local kb_x10=$((bytes * 10 / 1024))
+        printf "%d.%d KB" $((kb_x10 / 10)) $((kb_x10 % 10))
+    else
+        printf "%d B" "$bytes"
+    fi
+}
+
+_human_duration() {
+    local secs=$1
+    if ((secs >= 3600)); then
+        printf "%dh %dm %ds" $((secs / 3600)) $((secs % 3600 / 60)) $((secs % 60))
+    elif ((secs >= 60)); then
+        printf "%dm %ds" $((secs / 60)) $((secs % 60))
+    else
+        printf "%ds" "$secs"
+    fi
+}
+
+_confirm() {
+    [[ "$SKIP_CONFIRM" == "true" ]] && return 0
+    local msg="${1:-Proceed?}"
+    read -rp "  ${msg} [Y/n] " answer
+    case "${answer,,}" in
+        n | no) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# --- path normalization ---
+
+_normalize_path() {
+    local p="$1"
+    while [[ "$p" != "/" && "$p" == */ ]]; do
+        p="${p%/}"
+    done
+    echo "$p"
+}
+
+# --- log rotation ---
+
+_rotate_logs() {
+    local max="$KEEP_LOGS"
+    ((max <= 0)) && return 0
+    # find all logs, sort by mtime oldest-first, prune excess
+    local log_count
+    log_count=$(find "$LOG_DIR" -maxdepth 1 -name '*.log' -type f 2>/dev/null | wc -l | tr -d ' ')
+    if ((log_count > max)); then
+        find "$LOG_DIR" -maxdepth 1 -name '*.log' -type f -print0 2>/dev/null |
+            xargs -0 stat -f '%m %N' 2>/dev/null | sort -n | head -n "$((log_count - max))" |
+            awk '{print $2}' | xargs rm -f 2>/dev/null ||
+            find "$LOG_DIR" -maxdepth 1 -name '*.log' -type f -print0 2>/dev/null |
+            xargs -0 stat --format='%Y %n' 2>/dev/null | sort -n | head -n "$((log_count - max))" |
+                awk '{print $2}' | xargs rm -f 2>/dev/null || true
+    fi
+}
+
+# --- spinner ---
+
+_start_spinner() {
+    local msg="${1:-Working...}"
+    if [[ ! -t 1 ]]; then
+        return
+    fi
+    (
+        # shellcheck disable=SC1003
+        local chars='|/-\'
+        local i=0
+        while true; do
+            printf "\r  %s %s" "${chars:i++%4:1}" "$msg"
+            sleep 0.2
+        done
+    ) &
+    SPINNER_PID=$!
+    CLEANUP_PIDS+=("$SPINNER_PID")
+}
+
+_stop_spinner() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+        printf "\r\033[K"
+    fi
+}
+
+# --- config file ---
+
+_load_config() {
+    [[ ! -f "$CONFIG_FILE" ]] && return 0
+
+    while IFS='=' read -r key val; do
+        # skip comments and blank lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        # trim whitespace
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        # strip quotes
+        val="${val#\"}"
+        val="${val%\"}"
+        val="${val#\'}"
+        val="${val%\'}"
+
+        case "$key" in
+            host) [[ -z "$REMOTE_HOST" ]] && REMOTE_HOST="$val" ;;
+            user) [[ -z "$REMOTE_USER" ]] && REMOTE_USER="$val" ;;
+            remote_path) [[ -z "$REMOTE_PATH" ]] && REMOTE_PATH="$val" ;;
+            local_path) [[ -z "$LOCAL_PATH" ]] && LOCAL_PATH="$val" ;;
+            port) [[ "$SSH_PORT" == "22" ]] && SSH_PORT="$val" ;;
+            key) [[ -z "$SSH_KEY" ]] && SSH_KEY="$val" ;;
+            mode) [[ "$MODE" == "auto" ]] && MODE="$val" ;;
+            compress) [[ "$COMPRESS" == "auto" ]] && COMPRESS="$val" ;;
+            jobs) [[ "$PARALLEL_JOBS" == "8" ]] && PARALLEL_JOBS="$val" ;;
+            streams) [[ "$NUM_STREAMS" == "4" ]] && NUM_STREAMS="$val" ;;
+            nc_port) [[ "$NC_BASE_PORT" == "19000" ]] && NC_BASE_PORT="$val" ;;
+            verify) VERIFY="$val" ;;
+            bwlimit) [[ -z "$BANDWIDTH_LIMIT" ]] && BANDWIDTH_LIMIT="$val" ;;
+            local_ip) [[ -z "$LOCAL_IP_OVERRIDE" ]] && LOCAL_IP_OVERRIDE="$val" ;;
+            symlinks) [[ "$SYMLINK_MODE" == "preserve" ]] && SYMLINK_MODE="$val" ;;
+            jump) [[ -z "$JUMP_HOST" ]] && JUMP_HOST="$val" ;;
+            keep_logs) [[ "$KEEP_LOGS" == "20" ]] && KEEP_LOGS="$val" ;;
+            exclude) EXCLUDES+=("$val") ;;
+            exclude_from) [[ -z "$EXCLUDE_FROM" ]] && EXCLUDE_FROM="$val" ;;
+            newer) [[ -z "$NEWER_THAN" ]] && NEWER_THAN="$val" ;;
+            skip_scan) [[ "$SKIP_SCAN" == "false" ]] && SKIP_SCAN="$val" ;;
+        esac
+    done <"$CONFIG_FILE"
+}
+
+# --- exclude helpers ---
+
+_load_excludes() {
+    if [[ -n "$EXCLUDE_FROM" ]]; then
+        if [[ ! -f "$EXCLUDE_FROM" ]]; then
+            die "Exclude-from file not found: $EXCLUDE_FROM"
+        fi
+        while IFS= read -r pattern; do
+            [[ "$pattern" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$pattern" ]] && continue
+            EXCLUDES+=("$pattern")
+        done <"$EXCLUDE_FROM"
+    fi
+}
+
+_tar_exclude_flags() {
+    local flags=""
+    for pat in "${EXCLUDES[@]}"; do
+        flags+=" --exclude='${pat}'"
+    done
+    echo "$flags"
+}
+
+_rsync_exclude_flags() {
+    local flags=""
+    for pat in "${EXCLUDES[@]}"; do
+        flags+=" --exclude=${pat}"
+    done
+    echo "$flags"
+}
+
+_find_exclude_expr() {
+    local expr=""
+    for pat in "${EXCLUDES[@]}"; do
+        if [[ -n "$expr" ]]; then
+            expr+=" -a"
+        fi
+        expr+=" ! -name '${pat}'"
+    done
+    echo "$expr"
+}
+
+# --- cleanup ---
+
+_cleanup() {
+    local exit_code=$?
+    _stop_spinner
+    for pid in "${CLEANUP_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    if [[ -n "$SSH_MUX_SOCKET" && -S "$SSH_MUX_SOCKET" ]]; then
+        ssh -S "$SSH_MUX_SOCKET" -O exit "$REMOTE_HOST" 2>/dev/null || true
+    fi
+    # release lock
+    [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]] && rm -f "$LOCK_FILE"
+    if ((TRANSFER_START > 0)) && ((exit_code == 0)); then
+        local elapsed=$(($(date +%s) - TRANSFER_START))
+        echo ""
+        echo -e "${GREEN}${BOLD}Done in $(_human_duration $elapsed)${NC}"
+        if ((TOTAL_BYTES > 0)) && ((elapsed > 0)); then
+            echo -e "${GREEN}Avg: $(_human_bytes $((TOTAL_BYTES / elapsed)))/s${NC}"
+        fi
+    fi
+    exit "$exit_code"
+}
+
+_on_error() {
+    # only log if exit code indicates a real failure (not just [[ ]] returning 1)
+    local code=$?
+    if ((code > 1)); then
+        err "Error on line $1 (exit $code) — check log: $_log_file"
+    fi
+}
+
+_on_interrupt() {
+    echo ""
+    warn "Interrupted."
+    if [[ "$MODE" == "parallel-rsync" ]]; then
+        info "Resume: $SCRIPT_NAME --resume [same flags]"
+    else
+        info "Partial data at: $LOCAL_PATH"
+        info "Use --mode=parallel-rsync --resume to pick up where you left off"
+    fi
+    exit 130
+}
+
+# --- locking ---
+
+_acquire_lock() {
+    local lock_key
+    lock_key=$(printf '%s' "${LOCAL_PATH}" | tr '/' '_')
+    LOCK_FILE="${LOCK_DIR}/uft_${lock_key}.lock"
+
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            die "Another uft is writing to $LOCAL_PATH (pid $lock_pid). Wait or remove $LOCK_FILE"
+        fi
+        # stale lock
+        warn "Removing stale lock (pid $lock_pid not running)"
+        rm -f "$LOCK_FILE"
+    fi
+
+    echo "$$" >"$LOCK_FILE"
+}
+
+# --- ssh ---
+
+# build ssh opts as a global array to avoid the echo/read-back problem
+SSH_OPTS=()
+
+_build_ssh_opts() {
+    SSH_OPTS=(
+        "-o" "StrictHostKeyChecking=accept-new"
+        "-o" "ServerAliveInterval=30"
+        "-o" "ServerAliveCountMax=5"
+        "-o" "TCPKeepAlive=yes"
+        "-o" "Compression=no"
+        "-p" "$SSH_PORT"
+    )
+    [[ -n "$SSH_KEY" ]] && SSH_OPTS+=("-i" "$SSH_KEY")
+    [[ -n "$SSH_CIPHER" ]] && SSH_OPTS+=("-c" "$SSH_CIPHER")
+    [[ -n "$JUMP_HOST" ]] && SSH_OPTS+=("-J" "$JUMP_HOST")
+}
+
+_ssh_cmd() {
+    # prepend common paths that SSH login shells often miss
+    local path_fix='export PATH="/opt/homebrew/bin:/usr/local/bin:/snap/bin:$HOME/.local/bin:$PATH";'
+    if [[ -n "$SSH_MUX_SOCKET" && -S "$SSH_MUX_SOCKET" ]]; then
+        ssh -S "$SSH_MUX_SOCKET" "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "${path_fix} $*"
+    else
+        ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "${path_fix} $*"
+    fi
+}
+
+# safely pass a path to a remote shell by printf-quoting it
+_rquote() {
+    printf '%q' "$1"
+}
+
+_setup_ssh_mux() {
+    SSH_MUX_SOCKET="/tmp/uft-mux-${SESSION_ID}"
+    info "Opening SSH mux..."
+    ssh -fNM -S "$SSH_MUX_SOCKET" \
+        -o "ControlPersist=3600" \
+        "${SSH_OPTS[@]}" \
+        "${REMOTE_USER}@${REMOTE_HOST}" 2>>"$_log_file"
+    ok "SSH mux: $SSH_MUX_SOCKET"
+}
+
+# --- tool detection ---
+
+_detect_local_tools() {
+    _sub "Local"
+    LOCAL_TOOLS=()
+    local tools=(tar rsync lz4 pigz zstd gzip pv nc ncat socat iperf3)
+    for t in "${tools[@]}"; do
+        if command -v "$t" &>/dev/null; then
+            LOCAL_TOOLS+=("$t")
+            printf "    %-12s ${GREEN}ok${NC}\n" "$t"
+        else
+            printf "    %-12s ${DIM}-${NC}\n" "$t"
+        fi
+    done
+}
+
+_detect_remote_tools() {
+    _sub "Remote"
+    REMOTE_TOOLS=()
+    local tools=(tar lz4 pigz zstd gzip pv nc ncat socat)
+    local result
+    local tools_str
+    tools_str=$(printf '%s ' "${tools[@]}")
+    result=$(_ssh_cmd "for t in ${tools_str}; do command -v \$t &>/dev/null && echo \$t; done" 2>/dev/null) || true
+    while IFS= read -r tool; do
+        [[ -z "$tool" ]] && continue
+        REMOTE_TOOLS+=("$tool")
+        printf "    %-12s ${GREEN}ok${NC}\n" "$tool"
+    done <<<"$result"
+
+    for t in "${tools[@]}"; do
+        local found=false
+        for rt in "${REMOTE_TOOLS[@]}"; do
+            [[ "$rt" == "$t" ]] && found=true && break
+        done
+        $found || printf "    %-12s ${DIM}-${NC}\n" "$t"
+    done
+}
+
+_has_local() { printf '%s\n' "${LOCAL_TOOLS[@]}" | grep -qx "$1" 2>/dev/null; }
+_has_remote() { printf '%s\n' "${REMOTE_TOOLS[@]}" | grep -qx "$1" 2>/dev/null; }
+
+# figure out which netcat works and how to call it
+NC_LISTEN_CMD=""
+NC_SEND_CMD=""
+
+_detect_nc_flavor() {
+    # local side: try nc -l <port>, fall back to ncat --listen <port>
+    if _has_local "ncat"; then
+        NC_LISTEN_CMD="ncat --listen"
+    elif _has_local "nc"; then
+        # test if nc accepts `nc -l <port>` (BSD) or needs `nc -l -p <port>` (GNU)
+        if nc -h 2>&1 | grep -q '\-p'; then
+            NC_LISTEN_CMD="nc -l -p"
+        else
+            NC_LISTEN_CMD="nc -l"
+        fi
+    fi
+
+    # remote side
+    if _has_remote "ncat"; then
+        NC_SEND_CMD="ncat -w 10"
+    elif _has_remote "nc"; then
+        NC_SEND_CMD="nc -w 10"
+    fi
+}
+
+# --- local IP detection ---
+
+_detect_local_ip() {
+    if [[ -n "$LOCAL_IP_OVERRIDE" ]]; then
+        echo "$LOCAL_IP_OVERRIDE"
+        return
+    fi
+
+    local ip=""
+
+    # macOS: try all interfaces, not just en0
+    if command -v ifconfig &>/dev/null; then
+        ip=$(ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -1 | awk '{print $2}')
+    fi
+
+    # Linux fallback
+    if [[ -z "$ip" ]] && command -v ip &>/dev/null; then
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)
+    fi
+    if [[ -z "$ip" ]] && command -v hostname &>/dev/null; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+
+    echo "$ip"
+}
+
+# --- compression ---
+
+_select_compressor() {
+    if [[ "$COMPRESS" != "auto" ]]; then
+        info "Compression: $COMPRESS"
+        return
+    fi
+
+    if _has_remote "lz4" && _has_local "lz4"; then
+        COMPRESS="lz4"
+    elif _has_remote "pigz" && _has_local "pigz"; then
+        COMPRESS="pigz"
+    elif _has_remote "zstd" && _has_local "zstd"; then
+        COMPRESS="zstd"
+    elif _has_remote "gzip" && _has_local "gzip"; then
+        COMPRESS="gzip"
+    else
+        COMPRESS="none"
+    fi
+    info "Compression: ${BOLD}$COMPRESS${NC}"
+}
+
+_compress_cmd() {
+    case "$COMPRESS" in
+        lz4) echo "lz4 -1 -" ;;
+        pigz) echo "pigz -1" ;;
+        zstd) echo "zstd -1 -T0 -" ;;
+        gzip) echo "gzip -1" ;;
+        *) echo "cat" ;;
+    esac
+}
+
+_decompress_cmd() {
+    case "$COMPRESS" in
+        lz4) echo "lz4 -d -" ;;
+        pigz) echo "pigz -d" ;;
+        zstd) echo "zstd -d -T0 -" ;;
+        gzip) echo "gzip -d" ;;
+        *) echo "cat" ;;
+    esac
+}
+
+# pipe decompressor — avoids eval
+_decompress_pipe() {
+    case "$COMPRESS" in
+        lz4) lz4 -d - ;;
+        pigz) pigz -d ;;
+        zstd) zstd -d -T0 - ;;
+        gzip) gzip -d ;;
+        *) cat ;;
+    esac
+}
+
+# --- tar flags ---
+
+_tar_create_flags() {
+    local flags="cf -"
+    if [[ "$SYMLINK_MODE" == "dereference" ]]; then
+        flags="chf -"
+    fi
+    echo "$flags"
+}
+
+# --- preflight ---
+
+_preflight() {
+    _header "Preflight"
+
+    # normalize paths
+    REMOTE_PATH=$(_normalize_path "$REMOTE_PATH")
+    LOCAL_PATH=$(_normalize_path "$LOCAL_PATH")
+
+    [[ -z "$REMOTE_HOST" ]] && die "Missing --host"
+    [[ -z "$REMOTE_USER" ]] && die "Missing --user"
+    [[ -z "$REMOTE_PATH" ]] && die "Missing --remote-path"
+    [[ -z "$LOCAL_PATH" ]] && die "Missing --local-path"
+
+    _sub "SSH"
+    if _ssh_cmd "echo ok" &>/dev/null; then
+        ok "${REMOTE_USER}@${REMOTE_HOST}:${SSH_PORT}"
+    else
+        die "Cannot connect to ${REMOTE_USER}@${REMOTE_HOST}:${SSH_PORT}"
+    fi
+
+    local rpath_q
+    rpath_q=$(_rquote "$REMOTE_PATH")
+    _ssh_cmd "test -d ${rpath_q}" 2>/dev/null || die "Remote path not found: $REMOTE_PATH"
+    ok "Remote path: $REMOTE_PATH"
+
+    _setup_ssh_mux
+
+    _header "Tools"
+    _detect_local_tools
+    echo ""
+    _detect_remote_tools
+    echo ""
+    _detect_nc_flavor
+    _select_compressor
+
+    if [[ "${#EXCLUDES[@]}" -gt 0 ]]; then
+        info "Excludes: ${EXCLUDES[*]}"
+    fi
+
+    if [[ "$SKIP_SCAN" == "true" ]]; then
+        _header "Remote scan (skipped)"
+        warn "Skipped file scan (--skip-scan). File count and size unknown."
+        TOTAL_FILES=0
+        TOTAL_BYTES=0
+    else
+        _header "Remote scan"
+
+        local find_excl=""
+        find_excl=$(_find_exclude_expr)
+
+        _start_spinner "Scanning remote files..."
+
+        local stats
+        stats=$(_ssh_cmd "
+            rpath=${rpath_q}
+            cd \"\$rpath\" 2>/dev/null || exit 1
+            count=\$(find . -type f ${find_excl} 2>/dev/null | wc -l | tr -d ' ')
+            dircount=\$(find . -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+            size=\$(du -sb . 2>/dev/null | awk '{print \$1}')
+            [ -z \"\$size\" ] && size=\$(du -sk . 2>/dev/null | awk '{print \$1 * 1024}')
+            [ -z \"\$size\" ] && size=0
+            echo \"\$count|\$dircount|\$size\"
+        " 2>/dev/null) || {
+            _stop_spinner
+            die "Failed to scan remote directory"
+        }
+
+        _stop_spinner
+
+        TOTAL_FILES=$(echo "$stats" | cut -d'|' -f1)
+        local dir_count
+        dir_count=$(echo "$stats" | cut -d'|' -f2)
+        TOTAL_BYTES=$(echo "$stats" | cut -d'|' -f3)
+
+        [[ -z "$TOTAL_BYTES" || "$TOTAL_BYTES" == "0" ]] && die "Could not determine remote directory size"
+
+        ok "Files:  ${BOLD}$(printf "%'d" "$TOTAL_FILES")${NC}"
+        ok "Dirs:   ${BOLD}$(printf "%'d" "$dir_count")${NC}"
+        ok "Size:   ${BOLD}$(_human_bytes "$TOTAL_BYTES")${NC}"
+
+        _sub "Disk space"
+        mkdir -p "$LOCAL_PATH"
+        local available_kb
+        available_kb=$(df -k "$LOCAL_PATH" | awk 'NR==2{print $4}')
+        # some systems wrap long lines; handle that
+        [[ -z "$available_kb" ]] && available_kb=$(df -k "$LOCAL_PATH" | tail -1 | awk '{print $4}')
+        local available_bytes=$((available_kb * 1024))
+        # 10% margin, pure bash
+        local needed=$((TOTAL_BYTES + TOTAL_BYTES / 10))
+
+        if ((available_bytes >= needed)); then
+            ok "$(_human_bytes "$available_bytes") free (need ~$(_human_bytes "$needed"))"
+        else
+            die "Not enough space: $(_human_bytes "$available_bytes") free, need ~$(_human_bytes "$needed")"
+        fi
+    fi
+
+    # lock
+    mkdir -p "$LOCAL_PATH"
+    _acquire_lock
+
+    echo ""
+    echo -e "  ${BOLD}Plan:${NC}"
+    echo -e "    From:   ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"
+    echo -e "    To:     ${LOCAL_PATH}"
+    if ((TOTAL_FILES > 0)); then
+        echo -e "    Files:  $(printf "%'d" "$TOTAL_FILES") ($(_human_bytes "$TOTAL_BYTES"))"
+    else
+        echo -e "    Files:  (scan skipped)"
+    fi
+    echo -e "    Mode:   ${BOLD}${MODE}${NC}"
+    echo -e "    Compr:  ${COMPRESS}"
+    [[ -n "$JUMP_HOST" ]] && echo -e "    Jump:   ${JUMP_HOST}"
+    [[ -n "$NEWER_THAN" ]] && echo -e "    Newer:  ${NEWER_THAN}"
+    [[ "${#EXCLUDES[@]}" -gt 0 ]] && echo -e "    Excl:   ${#EXCLUDES[@]} pattern(s)"
+    echo ""
+}
+
+# --- benchmark ---
+
+_benchmark_ciphers() {
+    _sub "SSH cipher throughput (500MB through each)"
+    echo ""
+
+    local ciphers=("aes128-gcm@openssh.com" "aes256-gcm@openssh.com"
+        "chacha20-poly1305@openssh.com" "aes128-ctr" "aes256-ctr")
+    local best_rate=0
+
+    for cipher in "${ciphers[@]}"; do
+        local test_opts=("${SSH_OPTS[@]}")
+        # strip existing -c flag
+        local clean_opts=()
+        local skip_next=false
+        for o in "${test_opts[@]}"; do
+            if $skip_next; then
+                skip_next=false
+                continue
+            fi
+            [[ "$o" == "-c" ]] && skip_next=true && continue
+            clean_opts+=("$o")
+        done
+        clean_opts+=("-c" "$cipher")
+
+        local start end elapsed rate
+        start=$(date +%s)
+
+        dd if=/dev/zero bs=1M count=500 2>/dev/null |
+            ssh "${clean_opts[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "cat >/dev/null" 2>/dev/null
+
+        end=$(date +%s)
+        elapsed=$((end - start))
+        ((elapsed == 0)) && elapsed=1
+        rate=$((500 / elapsed))
+
+        printf "    %-38s ${BOLD}%6s MB/s${NC}" "$cipher" "$rate"
+
+        if ((rate > best_rate)); then
+            best_rate=$rate
+            FASTEST_CIPHER="$cipher"
+            printf "  %s<- best%s" "$GREEN" "$NC"
+        fi
+        echo ""
+    done
+
+    echo ""
+    ok "Fastest: ${BOLD}${FASTEST_CIPHER}${NC} (~${best_rate} MB/s)"
+    SSH_CIPHER="$FASTEST_CIPHER"
+}
+
+_benchmark_network_raw() {
+    _sub "Raw throughput (no encryption)"
+    echo ""
+
+    if [[ -z "$NC_LISTEN_CMD" || -z "$NC_SEND_CMD" ]]; then
+        warn "netcat not usable on both ends, skipping"
+        return
+    fi
+
+    local port=$((NC_BASE_PORT + 99))
+    local local_ip
+    local_ip=$(_detect_local_ip)
+    if [[ -z "$local_ip" ]]; then
+        warn "Can't determine local IP, skipping"
+        return
+    fi
+
+    info "500MB over netcat ($local_ip:$port)..."
+
+    $NC_LISTEN_CMD "$port" >/dev/null 2>&1 &
+    local listener_pid=$!
+    CLEANUP_PIDS+=("$listener_pid")
+    sleep 1
+
+    local start end elapsed rate
+    start=$(date +%s)
+    _ssh_cmd "dd if=/dev/zero bs=1M count=500 2>/dev/null | ${NC_SEND_CMD} ${local_ip} ${port}" 2>/dev/null || true
+    end=$(date +%s)
+    elapsed=$((end - start))
+    ((elapsed == 0)) && elapsed=1
+    rate=$((500 / elapsed))
+
+    wait "$listener_pid" 2>/dev/null || true
+    ok "Raw: ${BOLD}~${rate} MB/s${NC}"
+}
+
+_benchmark() {
+    _header "Benchmark"
+    _benchmark_ciphers
+    echo ""
+    _benchmark_network_raw
+
+    _header "Results"
+    echo -e "  ${GREEN}1.${NC} ${BOLD}tar-nc${NC}        Trusted network only, no encryption"
+    echo -e "  ${GREEN}2.${NC} ${BOLD}tar-stream${NC}    Encrypted, cipher: ${BOLD}${FASTEST_CIPHER}${NC}"
+    echo -e "  ${GREEN}3.${NC} ${BOLD}parallel-rsync${NC} Resumable, ${PARALLEL_JOBS} streams"
+    echo ""
+}
+
+# --- dry-run time estimation ---
+
+_estimate_time() {
+    _header "Time estimate"
+    if ((TOTAL_BYTES == 0)); then
+        warn "No size data (scan skipped) — cannot estimate"
+        return
+    fi
+    info "Quick throughput test (10MB)..."
+    local start end elapsed rate est_secs
+    start=$(date +%s)
+    dd if=/dev/zero bs=1M count=10 2>/dev/null | _ssh_cmd "cat >/dev/null" 2>/dev/null
+    end=$(date +%s)
+    elapsed=$((end - start))
+    ((elapsed == 0)) && elapsed=1
+    rate=$((10485760 / elapsed))
+    if ((rate > 0)); then
+        est_secs=$((TOTAL_BYTES / rate))
+        ok "SSH throughput: ~$(_human_bytes "$rate")/s"
+        ok "Estimated time: ~$(_human_duration "$est_secs")"
+    else
+        warn "Could not measure throughput"
+    fi
+}
+
+# --- transfer: tar-stream ---
+
+_transfer_tar_stream() {
+    _header "Transfer [tar-stream]"
+
+    local comp_r
+    comp_r=$(_compress_cmd)
+
+    local tar_flags
+    tar_flags=$(_tar_create_flags)
+
+    local tar_excl=""
+    if [[ "${#EXCLUDES[@]}" -gt 0 ]]; then
+        tar_excl=$(_tar_exclude_flags)
+    fi
+
+    local tar_newer=""
+    if [[ -n "$NEWER_THAN" ]]; then
+        tar_newer=" --newer='${NEWER_THAN}'"
+    fi
+
+    info "tar | $comp_r -> SSH($SSH_CIPHER) -> decompress | tar"
+    echo ""
+
+    mkdir -p "$LOCAL_PATH"
+
+    if [[ "$RESUME" == "true" ]]; then
+        warn "tar-stream can't resume — all files will be re-sent"
+        warn "Use --mode=parallel-rsync for resumable transfers"
+    fi
+
+    TRANSFER_START=$(date +%s)
+    local rpath_q
+    rpath_q=$(_rquote "$REMOTE_PATH")
+    local remote_cmd="cd ${rpath_q} && tar ${tar_flags}${tar_excl}${tar_newer} . | ${comp_r}"
+
+    local rc=0
+    if [[ -n "$BANDWIDTH_LIMIT" ]] && _has_local "pv"; then
+        _ssh_cmd "$remote_cmd" 2>>"$_log_file" |
+            pv --rate-limit "${BANDWIDTH_LIMIT}k" --timer --rate --bytes --name "uft" |
+            _decompress_pipe |
+            tar xf - -C "$LOCAL_PATH" || rc=$?
+    elif _has_local "pv"; then
+        # pv measures raw bytes through the pipe (compressed).
+        # don't pass --size since we only know the uncompressed size.
+        _ssh_cmd "$remote_cmd" 2>>"$_log_file" |
+            pv --timer --rate --bytes --name "uft" |
+            _decompress_pipe |
+            tar xf - -C "$LOCAL_PATH" || rc=$?
+    else
+        if [[ -n "$BANDWIDTH_LIMIT" ]]; then
+            warn "Bandwidth limit requires pv — install pv for throttling"
+        fi
+        info "Tip: install pv for a progress bar"
+        _ssh_cmd "$remote_cmd" 2>>"$_log_file" |
+            _decompress_pipe |
+            tar xf - -C "$LOCAL_PATH" || rc=$?
+    fi
+
+    if ((rc != 0)); then
+        err "Transfer failed (exit $rc). Data may be incomplete."
+        err "Use --mode=parallel-rsync --resume to recover."
+        VERIFY="true"
+    else
+        ok "tar-stream done"
+    fi
+}
+
+# --- transfer: tar-nc (unencrypted) ---
+
+_nc_reachability_check() {
+    local local_ip=$1 port=$2
+    # start listener, have remote try to connect, see if it works
+    $NC_LISTEN_CMD "$port" >/dev/null 2>&1 &
+    local pid=$!
+    CLEANUP_PIDS+=("$pid")
+    sleep 0.5
+
+    if _ssh_cmd "echo ok | ${NC_SEND_CMD} ${local_ip} ${port}" &>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+        return 0
+    else
+        kill "$pid" 2>/dev/null || true
+        return 1
+    fi
+}
+
+_transfer_tar_nc_single() {
+    _header "Transfer [tar-nc] (single stream)"
+
+    local comp_r
+    comp_r=$(_compress_cmd)
+
+    local tar_flags
+    tar_flags=$(_tar_create_flags)
+
+    local tar_excl=""
+    if [[ "${#EXCLUDES[@]}" -gt 0 ]]; then
+        tar_excl=$(_tar_exclude_flags)
+    fi
+
+    local tar_newer=""
+    if [[ -n "$NEWER_THAN" ]]; then
+        tar_newer=" --newer='${NEWER_THAN}'"
+    fi
+
+    local local_ip
+    local_ip=$(_detect_local_ip)
+    [[ -z "$local_ip" ]] && die "Can't determine local IP. Set UFT_LOCAL_IP or use --mode=tar-stream"
+
+    local port="$NC_BASE_PORT"
+
+    info "tar | $comp_r -> nc $local_ip:${port} -> decompress | tar"
+    warn "Unencrypted — use only on trusted networks"
+
+    # test that remote can actually reach us
+    info "Testing connectivity..."
+    local test_port=$((port + 50))
+    if ! _nc_reachability_check "$local_ip" "$test_port"; then
+        die "Remote can't reach $local_ip:$test_port. Firewall? NAT? Use --mode=tar-stream"
+    fi
+    ok "Remote can reach local"
+    echo ""
+
+    mkdir -p "$LOCAL_PATH"
+    TRANSFER_START=$(date +%s)
+
+    local rpath_q
+    rpath_q=$(_rquote "$REMOTE_PATH")
+    local remote_cmd="cd ${rpath_q} && tar ${tar_flags}${tar_excl}${tar_newer} . | ${comp_r} | ${NC_SEND_CMD} ${local_ip} ${port}"
+
+    local rc=0
+    if [[ -n "$BANDWIDTH_LIMIT" ]] && _has_local "pv"; then
+        ($NC_LISTEN_CMD "$port" |
+            pv --rate-limit "${BANDWIDTH_LIMIT}k" --timer --rate --bytes --name "uft" |
+            _decompress_pipe |
+            tar xf - -C "$LOCAL_PATH") &
+    elif _has_local "pv"; then
+        ($NC_LISTEN_CMD "$port" |
+            pv --timer --rate --bytes --name "uft" |
+            _decompress_pipe |
+            tar xf - -C "$LOCAL_PATH") &
+    else
+        if [[ -n "$BANDWIDTH_LIMIT" ]]; then
+            warn "Bandwidth limit requires pv — install pv for throttling"
+        fi
+        ($NC_LISTEN_CMD "$port" | _decompress_pipe | tar xf - -C "$LOCAL_PATH") &
+    fi
+    local receiver_pid=$!
+    CLEANUP_PIDS+=("$receiver_pid")
+    sleep 1
+
+    _ssh_cmd "$remote_cmd" 2>>"$_log_file" || true
+
+    wait "$receiver_pid" 2>/dev/null || rc=$?
+
+    if ((rc != 0)); then
+        err "Transfer failed (exit $rc). Data may be incomplete."
+        err "Use --mode=parallel-rsync --resume to recover."
+        VERIFY="true"
+    else
+        ok "tar-nc done"
+    fi
+}
+
+_transfer_tar_nc_parallel() {
+    _header "Transfer [tar-nc] ($NUM_STREAMS streams)"
+
+    local comp_r
+    comp_r=$(_compress_cmd)
+
+    local tar_flags
+    tar_flags=$(_tar_create_flags)
+
+    local tar_excl=""
+    if [[ "${#EXCLUDES[@]}" -gt 0 ]]; then
+        tar_excl=$(_tar_exclude_flags)
+    fi
+
+    local tar_newer=""
+    if [[ -n "$NEWER_THAN" ]]; then
+        tar_newer=" --newer='${NEWER_THAN}'"
+    fi
+
+    local local_ip
+    local_ip=$(_detect_local_ip)
+    [[ -z "$local_ip" ]] && die "Can't determine local IP. Set UFT_LOCAL_IP"
+
+    warn "Unencrypted — use only on trusted networks"
+
+    info "Testing connectivity..."
+    local test_port=$((NC_BASE_PORT + 50))
+    if ! _nc_reachability_check "$local_ip" "$test_port"; then
+        die "Remote can't reach $local_ip:$test_port. Firewall? NAT? Use --mode=tar-stream"
+    fi
+    ok "Remote can reach local"
+    echo ""
+
+    mkdir -p "$LOCAL_PATH"
+
+    local rpath_q
+    rpath_q=$(_rquote "$REMOTE_PATH")
+
+    local all_dirs
+    all_dirs=$(_ssh_cmd "find ${rpath_q} -mindepth 1 -maxdepth 1 -type d | sort" 2>/dev/null)
+    local dir_count
+    dir_count=$(echo "$all_dirs" | wc -l | tr -d ' ')
+
+    info "Splitting $dir_count dirs across $NUM_STREAMS streams"
+
+    TRANSFER_START=$(date +%s)
+
+    local stream_pids=()
+    local per_stream=$(((dir_count + NUM_STREAMS - 1) / NUM_STREAMS))
+
+    for ((s = 0; s < NUM_STREAMS; s++)); do
+        local port=$((NC_BASE_PORT + s))
+        local offset=$((s * per_stream + 1))
+        local subset
+        subset=$(echo "$all_dirs" | sed -n "${offset},$((offset + per_stream - 1))p")
+        [[ -z "$subset" ]] && continue
+
+        # build a safe list of basenames for tar
+        local tar_args=""
+        while IFS= read -r d; do
+            local base
+            base=$(basename "$d")
+            tar_args+=" $(_rquote "$base")"
+        done <<<"$subset"
+
+        info "Stream $((s + 1)): port $port"
+
+        if [[ -n "$BANDWIDTH_LIMIT" ]] && _has_local "pv"; then
+            ($NC_LISTEN_CMD "$port" |
+                pv --rate-limit "${BANDWIDTH_LIMIT}k" --quiet |
+                _decompress_pipe | tar xf - -C "$LOCAL_PATH") &
+        else
+            ($NC_LISTEN_CMD "$port" | _decompress_pipe | tar xf - -C "$LOCAL_PATH") &
+        fi
+        local rpid=$!
+        CLEANUP_PIDS+=("$rpid")
+        stream_pids+=("$rpid")
+        sleep 0.5
+
+        _ssh_cmd "cd ${rpath_q} && tar ${tar_flags}${tar_excl}${tar_newer} ${tar_args} | ${comp_r} | ${NC_SEND_CMD} ${local_ip} ${port}" >>"$_log_file" 2>&1 &
+        CLEANUP_PIDS+=("$!")
+    done
+
+    info "Waiting on $NUM_STREAMS streams..."
+    local any_fail=0
+    for pid in "${stream_pids[@]}"; do
+        wait "$pid" 2>/dev/null || any_fail=1
+    done
+
+    if ((any_fail != 0)); then
+        err "One or more streams failed. Data may be incomplete."
+        err "Use --mode=parallel-rsync --resume to recover."
+        VERIFY="true"
+    else
+        ok "$NUM_STREAMS streams done"
+    fi
+}
+
+_transfer_tar_nc() {
+    if [[ -z "$NC_LISTEN_CMD" || -z "$NC_SEND_CMD" ]]; then
+        die "netcat not available. Install nc/ncat or use --mode=tar-stream"
+    fi
+    # warn about jump host + netcat
+    if [[ -n "$JUMP_HOST" ]]; then
+        warn "Jump host + tar-nc may fail (remote can't reach local through bastion)"
+        warn "Falling back to tar-stream"
+        _transfer_tar_stream
+        return
+    fi
+    if ((NUM_STREAMS > 1)); then
+        _transfer_tar_nc_parallel
+    else
+        _transfer_tar_nc_single
+    fi
+}
+
+# --- transfer: parallel-rsync ---
+
+_transfer_parallel_rsync() {
+    _header "Transfer [parallel-rsync] ($PARALLEL_JOBS jobs)"
+
+    command -v rsync &>/dev/null || die "rsync not found"
+
+    if [[ -n "$NEWER_THAN" ]]; then
+        warn "--newer is only supported in tar modes. Ignored for parallel-rsync."
+    fi
+
+    mkdir -p "$LOCAL_PATH"
+    local path_key
+    path_key=$(printf '%s_%s' "$REMOTE_HOST" "$REMOTE_PATH" | tr '/' '_')
+    local manifest="${MANIFEST_DIR}/${path_key}.manifest"
+    local resume_file="${RESUME_DIR}/${path_key}.done"
+
+    local rpath_q
+    rpath_q=$(_rquote "$REMOTE_PATH")
+
+    info "Listing remote dirs..."
+    local all_entries
+    all_entries=$(_ssh_cmd "find ${rpath_q} -mindepth 1 -maxdepth 1 | sort" 2>/dev/null)
+    echo "$all_entries" >"$manifest"
+
+    local total_entries
+    total_entries=$(echo "$all_entries" | wc -l | tr -d ' ')
+    ok "$total_entries entries"
+
+    local completed=()
+    if [[ "$RESUME" == "true" && -f "$resume_file" ]]; then
+        while IFS= read -r line; do
+            completed+=("$line")
+        done <"$resume_file"
+        info "Resuming — ${#completed[@]} already done"
+    fi
+    touch "$resume_file"
+
+    local pending_entries=""
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        local skip=false
+        for done_entry in "${completed[@]}"; do
+            [[ "$done_entry" == "$entry" ]] && skip=true && break
+        done
+        $skip || pending_entries+="${entry}"$'\n'
+    done <<<"$all_entries"
+
+    local pending_count
+    pending_count=$(echo -n "$pending_entries" | grep -c '^' || echo 0)
+    info "$pending_count pending, ${#completed[@]} skipped"
+
+    # --- smart partitioning (bin-packing by size) ---
+    info "Measuring entry sizes for balanced partitioning..."
+    local entry_sizes
+    entry_sizes=$(_ssh_cmd "
+        while IFS= read -r d; do
+            [ -z \"\$d\" ] && continue
+            s=\$(du -sk \"\$d\" 2>/dev/null | awk '{print \$1}')
+            [ -z \"\$s\" ] && s=0
+            echo \"\${s}|\${d}\"
+        done <<'ENTRIES'
+$(echo -n "$pending_entries")
+ENTRIES
+    " 2>/dev/null) || entry_sizes=""
+
+    TRANSFER_START=$(date +%s)
+
+    local rsync_ssh="ssh"
+    [[ -n "$SSH_MUX_SOCKET" && -S "$SSH_MUX_SOCKET" ]] && rsync_ssh="ssh -S $SSH_MUX_SOCKET"
+    rsync_ssh+=" -p $SSH_PORT -o Compression=no"
+    [[ -n "$SSH_CIPHER" ]] && rsync_ssh+=" -c $SSH_CIPHER"
+    [[ -n "$SSH_KEY" ]] && rsync_ssh+=" -i $SSH_KEY"
+    [[ -n "$JUMP_HOST" ]] && rsync_ssh+=" -J $JUMP_HOST"
+
+    # --info requires rsync 3.1+; macOS ships 2.6.9
+    local rsync_opts=("-a")
+    if rsync --version 2>/dev/null | head -1 | grep -qE 'version [3-9]'; then
+        rsync_opts+=("--compress-level=1" "--info=name0,progress2")
+    fi
+    [[ -n "$BANDWIDTH_LIMIT" ]] && rsync_opts+=("--bwlimit=$BANDWIDTH_LIMIT")
+    [[ "$SYMLINK_MODE" == "dereference" ]] && rsync_opts+=("--copy-links")
+
+    # add exclude flags
+    for pat in "${EXCLUDES[@]}"; do
+        rsync_opts+=("--exclude=$pat")
+    done
+
+    # use a temp dir for per-process done markers and aggregate progress
+    local done_dir
+    done_dir=$(mktemp -d)
+    local progress_file="${done_dir}/_progress"
+    touch "$progress_file"
+
+    # bin-packing: assign entries to workers balanced by size
+    if [[ -n "$entry_sizes" ]]; then
+        # initialise worker buckets
+        declare -a _worker_load=()
+        declare -a _worker_list=()
+        for ((w = 0; w < PARALLEL_JOBS; w++)); do
+            _worker_load[w]=0
+            _worker_list[w]=""
+        done
+
+        # sort entries by size descending and assign each to least-loaded worker
+        while IFS='|' read -r sz ent; do
+            [[ -z "$ent" ]] && continue
+            [[ -z "$sz" ]] && sz=0
+            local min_w=0
+            local min_load=${_worker_load[0]}
+            for ((w = 1; w < PARALLEL_JOBS; w++)); do
+                # shellcheck disable=SC2004
+                if ((_worker_load[w] < min_load)); then
+                    min_w=$w
+                    min_load=${_worker_load[$w]}
+                fi
+            done
+            _worker_load[min_w]=$((_worker_load[min_w] + sz))
+            _worker_list[min_w]+="${ent}"$'\n'
+        done < <(echo "$entry_sizes" | sort -t'|' -k1 -rn)
+
+        # write per-worker lists and run rsync per worker
+        local worker_pids=()
+        for ((w = 0; w < PARALLEL_JOBS; w++)); do
+            local wlist="${_worker_list[$w]}"
+            [[ -z "$wlist" ]] && continue
+
+            (
+                set +e # don't exit on rsync errors — we handle them
+                while IFS= read -r entry; do
+                    [[ -z "$entry" ]] && continue
+                    local entry_name
+                    entry_name=$(basename "$entry")
+
+                    rsync "${rsync_opts[@]}" \
+                        -e "$rsync_ssh" \
+                        "${REMOTE_USER}@${REMOTE_HOST}:${entry}/" \
+                        "${LOCAL_PATH}/${entry_name}/" \
+                        >>/dev/null 2>&1
+
+                    local rc=$?
+                    if [[ $rc -eq 0 ]]; then
+                        echo "$entry" >>"$resume_file"
+                        # track bytes for aggregate progress
+                        local lsz
+                        if [[ "$(uname)" == "Darwin" ]]; then
+                            lsz=$(du -sk "${LOCAL_PATH}/${entry_name}" 2>/dev/null | awk '{print $1 * 1024}')
+                        else
+                            lsz=$(du -sb "${LOCAL_PATH}/${entry_name}" 2>/dev/null | awk '{print $1}')
+                        fi
+                        [[ -z "$lsz" ]] && lsz=0
+                        touch "${done_dir}/${entry_name}"
+                        echo "$lsz" >>"$progress_file"
+                        local done_count total_done
+                        done_count=$(find "$done_dir" -maxdepth 1 -type f ! -name '_progress' 2>/dev/null | wc -l | tr -d ' ')
+                        total_done=$(awk '{s+=$1}END{print s+0}' "$progress_file" 2>/dev/null)
+                        if ((TOTAL_BYTES > 0)); then
+                            local pct=$((total_done * 100 / TOTAL_BYTES))
+                            printf "\r  [%s/%s] %s / %s (%d%%)\033[K\n" "$done_count" "$pending_count" \
+                                "$(_human_bytes "$total_done")" "$(_human_bytes "$TOTAL_BYTES")" "$pct"
+                        else
+                            printf "\r  [%s/%s] %s\033[K\n" "$done_count" "$pending_count" \
+                                "$(_human_bytes "$total_done")"
+                        fi
+                    else
+                        printf "\r  [FAIL] %s (rc %d)\033[K\n" "$entry_name" "$rc" >&2
+                    fi
+                done <<<"$wlist"
+            ) &
+            worker_pids+=("$!")
+            CLEANUP_PIDS+=("${worker_pids[-1]}")
+        done
+
+        for pid in "${worker_pids[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+
+        unset _worker_load _worker_list
+    else
+        # fallback: original xargs approach if size measurement failed
+        warn "Could not measure entry sizes — using round-robin partitioning"
+        echo "$pending_entries" | grep -v '^$' | xargs -P "$PARALLEL_JOBS" -I '{}' bash -c '
+            entry="$1"
+            entry_name=$(basename "$entry")
+
+            rsync '"${rsync_opts[*]}"' \
+                -e "'"$rsync_ssh"'" \
+                "'"${REMOTE_USER}@${REMOTE_HOST}"':${entry}/" \
+                "'"$LOCAL_PATH"'/${entry_name}/" \
+                >>/dev/null 2>&1
+
+            rc=$?
+            if [[ $rc -eq 0 ]]; then
+                echo "$entry" >> "'"$resume_file"'"
+                touch "'"$done_dir"'/${entry_name}"
+                done_count=$(ls "'"$done_dir"'" 2>/dev/null | wc -l | tr -d " ")
+                printf "\r  [%s/'"$pending_count"'] %s\n" "$done_count" "$entry_name"
+            else
+                printf "\r  [FAIL] %s (rc %d)\n" "$entry_name" "$rc" >&2
+            fi
+        ' _ '{}'
+    fi
+
+    # root-level files
+    info "Syncing root files..."
+    rsync "${rsync_opts[@]}" \
+        -e "$rsync_ssh" \
+        --exclude='*/' \
+        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}/" \
+        "${LOCAL_PATH}/" \
+        >>"$_log_file" 2>&1 || true
+
+    rm -rf "$done_dir"
+    ok "parallel-rsync done"
+    info "State: $resume_file"
+}
+
+# --- verify ---
+
+_verify() {
+    [[ "$VERIFY" != "true" ]] && return 0
+
+    _header "Verify"
+
+    local rpath_q
+    rpath_q=$(_rquote "$REMOTE_PATH")
+
+    local find_excl=""
+    if [[ "${#EXCLUDES[@]}" -gt 0 ]]; then
+        find_excl=$(_find_exclude_expr)
+    fi
+
+    _sub "File counts"
+    local remote_count local_count
+    remote_count=$(_ssh_cmd "find ${rpath_q} -type f ${find_excl} | wc -l" 2>/dev/null | tr -d ' ')
+    local_count=$(find "$LOCAL_PATH" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+    echo -e "    Remote: ${BOLD}${remote_count}${NC}"
+    echo -e "    Local:  ${BOLD}${local_count}${NC}"
+
+    if [[ "$remote_count" == "$local_count" ]]; then
+        ok "Counts match ($remote_count)"
+    else
+        local diff=$((remote_count - local_count))
+        if ((diff < 0)); then diff=$((-diff)); fi
+        warn "Mismatch: $diff files off"
+        warn "Fix: --mode=parallel-rsync --resume"
+    fi
+
+    _sub "Sizes"
+    local remote_size local_size
+    remote_size=$(_ssh_cmd "du -sb ${rpath_q} 2>/dev/null | awk '{print \$1}'" 2>/dev/null)
+    [[ -z "$remote_size" ]] && remote_size=$(_ssh_cmd "du -sk ${rpath_q} 2>/dev/null | awk '{print \$1 * 1024}'" 2>/dev/null)
+    [[ -z "$remote_size" ]] && remote_size=0
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        local_size=$(du -sk "$LOCAL_PATH" 2>/dev/null | awk '{print $1 * 1024}')
+    else
+        local_size=$(du -sb "$LOCAL_PATH" 2>/dev/null | awk '{print $1}')
+    fi
+
+    echo -e "    Remote: ${BOLD}$(_human_bytes "$remote_size")${NC}"
+    echo -e "    Local:  ${BOLD}$(_human_bytes "$local_size")${NC}"
+
+    local size_diff
+    if ((remote_size > local_size)); then
+        size_diff=$((remote_size - local_size))
+    else
+        size_diff=$((local_size - remote_size))
+    fi
+
+    local tolerance=$((remote_size / 100))
+    if ((size_diff <= tolerance)); then
+        ok "Sizes match ($(_human_bytes "$size_diff") diff)"
+    else
+        warn "Size gap: $(_human_bytes "$size_diff")"
+    fi
+
+    if [[ "$CHECKSUM_VERIFY" == "true" ]]; then
+        _sub "Checksums (100 random files)"
+
+        local sample_files
+        sample_files=$(_ssh_cmd "find ${rpath_q} -type f ${find_excl} | shuf 2>/dev/null | head -100" 2>/dev/null) ||
+            sample_files=$(_ssh_cmd "find ${rpath_q} -type f ${find_excl} | awk 'BEGIN{srand()}{print rand(),\$0}' | sort -n | cut -d' ' -f2- | head -100" 2>/dev/null)
+
+        local mismatches=0 checked=0
+
+        while IFS= read -r remote_file; do
+            [[ -z "$remote_file" ]] && continue
+            local rel="${remote_file#"$REMOTE_PATH"/}"
+            local local_file="${LOCAL_PATH}/${rel}"
+
+            if [[ ! -f "$local_file" ]]; then
+                ((mismatches++))
+                continue
+            fi
+
+            local rmd5 lmd5
+            local rf_q
+            rf_q=$(_rquote "$remote_file")
+            rmd5=$(_ssh_cmd "md5sum ${rf_q} 2>/dev/null | awk '{print \$1}'" 2>/dev/null) ||
+                rmd5=$(_ssh_cmd "md5 -q ${rf_q}" 2>/dev/null)
+
+            if [[ "$(uname)" == "Darwin" ]]; then
+                lmd5=$(md5 -q "$local_file")
+            else
+                lmd5=$(md5sum "$local_file" | awk '{print $1}')
+            fi
+
+            if [[ "$rmd5" != "$lmd5" ]]; then
+                warn "Bad checksum: $rel"
+                ((mismatches++))
+            fi
+            ((checked++))
+            printf "\r    %d/100..." "$checked"
+        done <<<"$sample_files"
+
+        echo ""
+        if ((mismatches == 0)); then
+            ok "$checked files verified"
+        else
+            warn "$mismatches/$checked failed"
+        fi
+    fi
+}
+
+# --- auto mode ---
+
+_auto_select_mode() {
+    info "Picking transfer mode..."
+
+    if [[ "$RESUME" == "true" ]]; then
+        BEST_MODE="parallel-rsync"
+        info "Resume -> parallel-rsync"
+    elif [[ -n "$NC_LISTEN_CMD" && -n "$NC_SEND_CMD" && -z "$JUMP_HOST" ]]; then
+        BEST_MODE="tar-nc"
+        echo ""
+        echo -e "  ${YELLOW}tar-nc is fastest but sends data unencrypted.${NC}"
+        echo -e "  ${YELLOW}Only safe on private/trusted networks.${NC}"
+        echo ""
+        if ! _confirm "Use unencrypted transfer?"; then
+            BEST_MODE="tar-stream"
+        fi
+    else
+        BEST_MODE="tar-stream"
+    fi
+
+    MODE="$BEST_MODE"
+    ok "Mode: ${BOLD}$MODE${NC}"
+}
+
+# --- tuning tips ---
+
+_print_tuning() {
+    _header "Tuning tips"
+    echo -e "  ${BOLD}Missing tools:${NC}"
+    _has_local "lz4" || echo "    brew install lz4"
+    _has_local "pv" || echo "    brew install pv"
+    _has_remote "lz4" || echo "    (remote) sudo apt install lz4"
+    echo ""
+    echo -e "  ${BOLD}Linux TCP (both machines, /etc/sysctl.conf):${NC}"
+    echo "    net.core.rmem_max = 67108864"
+    echo "    net.core.wmem_max = 67108864"
+    echo "    net.ipv4.tcp_rmem = 4096 87380 33554432"
+    echo "    net.ipv4.tcp_wmem = 4096 65536 33554432"
+    echo "    net.ipv4.tcp_window_scaling = 1"
+    echo "    net.core.netdev_max_backlog = 5000"
+    echo ""
+    echo -e "  ${BOLD}macOS:${NC}"
+    echo "    sudo sysctl -w net.inet.tcp.recvspace=65536"
+    echo "    sudo sysctl -w net.inet.tcp.sendspace=65536"
+    echo ""
+}
+
+# --- setup / dependency check ---
+
+_setup() {
+    echo ""
+    echo -e "${BOLD}uft${NC} v${VERSION} — dependency check"
+    echo ""
+
+    local missing_local=()
+
+    echo -e "  ${BOLD}Local tools:${NC}"
+    for t in lz4 pv zstd pigz rsync nc; do
+        if command -v "$t" &>/dev/null; then
+            printf "    %-12s ${GREEN}ok${NC}\n" "$t"
+        else
+            printf "    %-12s ${RED}missing${NC}\n" "$t"
+            missing_local+=("$t")
+        fi
+    done
+
+    echo ""
+    if [[ ${#missing_local[@]} -eq 0 ]]; then
+        echo -e "  ${GREEN}All local tools present.${NC}"
+    else
+        echo -e "  ${YELLOW}Missing locally: ${missing_local[*]}${NC}"
+        echo ""
+        if command -v brew &>/dev/null; then
+            echo -e "  Install with: ${BOLD}brew install ${missing_local[*]}${NC}"
+            if _confirm "Install now?"; then
+                brew install "${missing_local[@]}" 2>&1 | tail -5
+                ok "Installed"
+            fi
+        elif command -v apt-get &>/dev/null; then
+            echo -e "  Install with: ${BOLD}sudo apt-get install ${missing_local[*]}${NC}"
+            if _confirm "Install now?"; then
+                sudo apt-get install -y "${missing_local[@]}" 2>&1 | tail -5
+                ok "Installed"
+            fi
+        elif command -v yum &>/dev/null; then
+            echo -e "  Install with: ${BOLD}sudo yum install ${missing_local[*]}${NC}"
+            if _confirm "Install now?"; then
+                sudo yum install -y "${missing_local[@]}" 2>&1 | tail -5
+                ok "Installed"
+            fi
+        else
+            echo "  Install them with your package manager."
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Required:${NC} bash 4+, ssh, tar (always present)"
+    echo -e "  ${BOLD}Recommended:${NC} lz4 (2x faster), pv (progress bar)"
+    echo -e "  ${BOLD}Optional:${NC} zstd, pigz, rsync, nc"
+    echo ""
+}
+
+# --- usage ---
+
+_usage() {
+    cat <<EOF
+uft v${VERSION} — bulk file transfer over SSH
+
+USAGE
+    $SCRIPT_NAME [OPTIONS]
+
+REQUIRED
+    -H, --host HOST          Remote hostname or IP
+    -u, --user USER          SSH username
+    -r, --remote-path PATH   Source directory on remote
+    -l, --local-path PATH    Destination directory locally
+
+OPTIONS
+    -m, --mode MODE          auto | tar-stream | tar-nc | parallel-rsync | benchmark
+    -c, --compress ALG       auto | lz4 | pigz | zstd | gzip | none
+    -j, --jobs N             Parallel rsync workers (default: 8)
+    -s, --streams N          Parallel netcat streams (default: 4)
+    -p, --port PORT          SSH port (default: 22)
+    -k, --key PATH           SSH key file
+    -b, --bwlimit KB/S       Bandwidth cap (rsync + tar modes with pv)
+    -J, --jump HOST          SSH jump/bastion host (ProxyJump)
+    --exclude PATTERN        Exclude files matching PATTERN (repeatable)
+    --exclude-from FILE      Read exclude patterns from FILE
+    --copy-links             Dereference/follow symlinks
+    --newer DATE             Only transfer files newer than DATE
+    --skip-scan              Skip remote file count/size scan
+    --keep-logs N            Keep N most recent logs (default: 20)
+    --config PATH            Config file path (default: ~/.uftrc)
+    --resume                 Pick up where a previous run left off
+    --verify / --no-verify   Post-transfer file count check (default: on)
+    --checksum               Spot-check md5 on 100 random files
+    --dry-run                Preflight + time estimate, don't transfer
+    --tuning                 Print performance tuning tips
+    -y, --yes                Skip confirmation prompts
+    --local-ip IP            Override auto-detected local IP (for tar-nc)
+    -h, --help               This message
+    --setup                  Check and install dependencies
+    --version                Print version and exit
+
+CONFIG FILE (~/.uftrc)
+    host = myserver.lan
+    user = deploy
+    compress = lz4
+    jobs = 16
+    exclude = *.tmp
+    exclude = .git
+    jump = bastion.example.com
+    keep_logs = 50
+
+EXAMPLES
+    $SCRIPT_NAME -H box.lan -u deploy -r /data/frames -l ./frames
+    $SCRIPT_NAME -H 10.0.0.5 -u root -r /data/frames -l ./frames -m tar-nc -s 8
+    $SCRIPT_NAME -H srv -u admin -r /data -l ./data -m parallel-rsync -j 16 --resume
+    $SCRIPT_NAME -H srv -u deploy -r /data -l ./data --exclude '*.log' --exclude '.git'
+    $SCRIPT_NAME -H srv -u deploy -r /data -l ./data --newer '2025-01-01' --skip-scan
+    $SCRIPT_NAME -H srv -u deploy -r /data -l ./data -J bastion.example.com
+
+MODES
+    tar-stream       encrypted, fastest for bulk downloads
+    tar-nc           unencrypted, trusted networks only
+    parallel-rsync   encrypted, resumable, incremental
+
+    Actual speed depends on your network. Run: uft -m benchmark
+EOF
+    exit 0
+}
+
+# --- arg parsing ---
+
+_parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -H | --host)
+                REMOTE_HOST="$2"
+                shift 2
+                ;;
+            -u | --user)
+                REMOTE_USER="$2"
+                shift 2
+                ;;
+            -r | --remote-path)
+                REMOTE_PATH="$2"
+                shift 2
+                ;;
+            -l | --local-path)
+                LOCAL_PATH="$2"
+                shift 2
+                ;;
+            -m | --mode)
+                MODE="$2"
+                shift 2
+                ;;
+            -c | --compress)
+                COMPRESS="$2"
+                shift 2
+                ;;
+            -j | --jobs)
+                PARALLEL_JOBS="$2"
+                shift 2
+                ;;
+            -s | --streams)
+                NUM_STREAMS="$2"
+                shift 2
+                ;;
+            -p | --port)
+                SSH_PORT="$2"
+                shift 2
+                ;;
+            -k | --key)
+                SSH_KEY="$2"
+                shift 2
+                ;;
+            -b | --bwlimit)
+                BANDWIDTH_LIMIT="$2"
+                shift 2
+                ;;
+            -J | --jump)
+                JUMP_HOST="$2"
+                shift 2
+                ;;
+            --exclude)
+                EXCLUDES+=("$2")
+                shift 2
+                ;;
+            --exclude-from)
+                EXCLUDE_FROM="$2"
+                shift 2
+                ;;
+            --copy-links)
+                SYMLINK_MODE="dereference"
+                shift
+                ;;
+            --newer)
+                NEWER_THAN="$2"
+                shift 2
+                ;;
+            --skip-scan)
+                SKIP_SCAN="true"
+                shift
+                ;;
+            --keep-logs)
+                KEEP_LOGS="$2"
+                shift 2
+                ;;
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --resume)
+                RESUME="true"
+                shift
+                ;;
+            --verify)
+                VERIFY="true"
+                shift
+                ;;
+            --no-verify)
+                VERIFY="false"
+                shift
+                ;;
+            --checksum)
+                CHECKSUM_VERIFY="true"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            --tuning)
+                _print_tuning
+                exit 0
+                ;;
+            -y | --yes)
+                SKIP_CONFIRM="true"
+                shift
+                ;;
+            --local-ip)
+                LOCAL_IP_OVERRIDE="$2"
+                shift 2
+                ;;
+            --setup)
+                _setup
+                exit 0
+                ;;
+            --version)
+                echo "uft v${VERSION}"
+                exit 0
+                ;;
+            -h | --help) _usage ;;
+            *) die "Unknown flag: $1" ;;
+        esac
+    done
+}
+
+# --- main ---
+
+_check_bash_version() {
+    if ((BASH_VERSINFO[0] < 4)); then
+        echo "uft requires bash 4+. You have bash ${BASH_VERSION}." >&2
+        echo "On macOS: brew install bash" >&2
+        exit 1
+    fi
+}
+
+main() {
+    _check_bash_version
+    _parse_args "$@"
+    _load_config
+    _load_excludes
+    _init_logging
+
+    echo ""
+    echo -e "${BOLD}uft${NC} v${VERSION} — session ${DIM}${SESSION_ID}${NC}"
+
+    if [[ -z "$SSH_CIPHER" ]]; then
+        if ssh -Q cipher 2>/dev/null | grep -q "aes128-gcm@openssh.com"; then
+            SSH_CIPHER="aes128-gcm@openssh.com"
+        else
+            SSH_CIPHER="aes256-ctr"
+        fi
+    fi
+
+    _build_ssh_opts
+    _preflight
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        _estimate_time
+        info "Dry run — stopping here."
+        _print_tuning
+        exit 0
+    fi
+
+    [[ "$MODE" == "auto" ]] && _auto_select_mode
+
+    if [[ "$MODE" == "benchmark" ]]; then
+        _benchmark
+        exit 0
+    fi
+
+    # confirmation before transfer
+    if [[ "$SKIP_CONFIRM" != "true" ]]; then
+        if ! _confirm "Start transfer?"; then
+            info "Cancelled."
+            exit 0
+        fi
+    fi
+
+    case "$MODE" in
+        tar-stream) _transfer_tar_stream ;;
+        tar-nc) _transfer_tar_nc ;;
+        parallel-rsync) _transfer_parallel_rsync ;;
+        *) die "Unknown mode: $MODE" ;;
+    esac
+
+    _verify
+
+    _header "Done"
+    local elapsed=$(($(date +%s) - TRANSFER_START))
+    echo -e "  Files:  $(printf "%'d" "$TOTAL_FILES")"
+    echo -e "  Size:   $(_human_bytes "$TOTAL_BYTES")"
+    echo -e "  Time:   $(_human_duration "$elapsed")"
+    ((elapsed > 0)) && echo -e "  Speed:  $(_human_bytes $((TOTAL_BYTES / elapsed)))/s"
+    echo -e "  Log:    $_log_file"
+    echo ""
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

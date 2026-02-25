@@ -1,0 +1,8 @@
+shell=bash
+disable=SC2155
+disable=SC2039
+disable=SC1090
+# ssh commands intentionally expand on client side
+disable=SC2029
+# xargs -I '{}' bash -c uses single quotes by design
+disable=SC2016

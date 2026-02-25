@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: shellcheck
+        run: shellcheck bin/uft
+
+      - name: build tarball
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          mkdir -p dist
+          tar czf "dist/uft-${VERSION}.tar.gz" \
+            --transform "s,^,uft-${VERSION}/," \
+            bin/ completions/ man/ Makefile LICENSE README.md CHANGELOG.md install.sh
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*.tar.gz
